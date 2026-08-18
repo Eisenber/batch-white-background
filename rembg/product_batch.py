@@ -268,6 +268,7 @@ def process_product_batch(
 
         manifest = {
             "options": {
+                "processing_engine": options.processing_engine,
                 "jpeg_quality": options.jpeg_quality,
                 "output_format": options.output_format,
             },

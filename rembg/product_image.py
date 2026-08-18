@@ -22,6 +22,7 @@ from .sessions.base import BaseSession
 
 QualityPreset = Literal["high", "fast"]
 OutputFormat = Literal["jpg", "jpeg", "png"]
+ProcessingEngine = Literal["local", "fal"]
 ResultStatus = Literal["processed", "review", "failed"]
 ImageInput = Union[bytes, bytearray, str, Path, PILImage]
 
@@ -31,6 +32,7 @@ class BatchOptions:
     """Stable options shared by the web UI and programmatic callers."""
 
     quality: QualityPreset = "high"
+    processing_engine: ProcessingEngine = "local"
     jpeg_quality: int = 95
     output_format: OutputFormat = "jpg"
     correct_geometry: bool = True
@@ -38,11 +40,15 @@ class BatchOptions:
 
     @property
     def model_name(self) -> str:
+        if self.processing_engine == "fal":
+            return "fal.ai BiRefNet Light 2K"
         return "birefnet-massive" if self.quality == "high" else "u2net"
 
     def validate(self) -> None:
         if self.quality not in ("high", "fast"):
             raise ValueError("quality must be 'high' or 'fast'")
+        if self.processing_engine not in ("local", "fal"):
+            raise ValueError("processing_engine must be 'local' or 'fal'")
         if not 75 <= self.jpeg_quality <= 100:
             raise ValueError("jpeg_quality must be between 75 and 100")
         if self.output_format not in ("jpg", "jpeg", "png"):
@@ -600,10 +606,15 @@ def process_product_image(
         if not masks:
             raise ValueError("Background-removal model returned no mask")
         mask = np.asarray(masks[0].convert("L"), dtype=np.uint8)
+        metrics["mask_returned_width"] = float(mask.shape[1])
+        metrics["mask_returned_height"] = float(mask.shape[0])
         if mask.shape != rgb.shape[:2]:
             mask = cv2.resize(
                 mask, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR
             )
+            metrics["mask_resized_to_source"] = 1.0
+        else:
+            metrics["mask_resized_to_source"] = 0.0
         mask, component_count = _largest_mask(mask)
         metrics["mask_component_count"] = float(component_count)
         steps.append(f"主体分割（{options.model_name}）")

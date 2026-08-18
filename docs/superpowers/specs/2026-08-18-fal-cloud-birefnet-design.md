@@ -73,10 +73,13 @@ not depend on the mask provider.
 5. Downloading and validating the returned grayscale PNG mask.
 6. Returning a Pillow `L` image aligned to the source dimensions.
 
-The adapter uses the official fal Python client behind a narrow internal
-gateway so tests can replace network calls without importing or contacting
-fal.ai. The API key is never accepted as a function parameter passed from the
-browser and is never included in exceptions, logs, manifests, or result data.
+The adapter uses fal.ai's documented HTTPS queue protocol through the existing
+`httpx` dependency, behind a narrow internal gateway that tests can replace
+without contacting fal.ai. It does not use the official `fal-client` submit
+helper because that helper automatically retries ambiguous transport failures,
+which could duplicate a billable submission. The API key is never accepted as
+a function parameter passed from the browser and is never included in
+exceptions, logs, manifests, or result data.
 
 The source is sent as an in-request data URI instead of first uploading it to a
 separate public URL. `sync_mode` is enabled so returned media is represented as

@@ -18,6 +18,7 @@ from .product_batch import (
     process_product_batch,
 )
 from .product_image import BatchOptions, decode_product_image
+from .fal_session import FalBiRefNetSession
 from .sessions.base import BaseSession
 
 
@@ -155,17 +156,42 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
 
     cleanup_stale_batches()
 
-    def run_batch(files, quality, output_format, previous_task, progress=gr.Progress()):
+    def run_batch(
+        files,
+        processing_engine,
+        quality,
+        output_format,
+        previous_task,
+        progress=gr.Progress(),
+    ):
         if not files:
             raise gr.Error("请先拖入 1–50 张保险柜图片。")
         if len(files) > 50:
             raise gr.Error("每批最多处理 50 张图片，请拆分后重试。")
         cleanup_batch_directory(previous_task)
-        options = BatchOptions(quality=quality, output_format=output_format)
+        options = BatchOptions(
+            quality=quality,
+            processing_engine=processing_engine,
+            output_format=output_format,
+        )
         try:
-            session = session_provider(options.model_name)
+            current = {"done": 0, "total": len(files), "filename": ""}
+
+            def cloud_stage(message: str) -> None:
+                filename = current["filename"]
+                progress(
+                    (current["done"], current["total"]),
+                    desc=f"{filename} · {message}" if filename else message,
+                )
+
+            session = (
+                FalBiRefNetSession(stage_callback=cloud_stage)
+                if processing_engine == "fal"
+                else session_provider(options.model_name)
+            )
 
             def update(done: int, total: int, filename: str) -> None:
+                current.update(done=done, total=total, filename=filename)
                 progress(
                     (done, total),
                     desc=f"正在处理：{filename}" if done < total else filename,
@@ -264,13 +290,13 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
         gr.HTML(
             """
             <div class="safe-shell safe-hero">
-              <div class="safe-kicker">SAFE PRODUCT IMAGING / LOCAL</div>
+              <div class="safe-kicker">SAFE PRODUCT IMAGING / HYBRID</div>
               <h1>保险柜白底主图工作台</h1>
-              <p>批量抠图、原位保真与必要回正。保持原图尺寸、主体大小和位置；不可靠的图片自动进入复核区。</p>
+              <p>云端 2K 蒙版、本地原像素合成与必要回正。保持原图尺寸、主体大小和位置；不可靠的图片自动进入复核区。</p>
               <div class="safe-plate" aria-label="输出规格">
                 <div><b>1 : 1</b><span>输出尺寸跟随原图</span></div>
                 <div><b>ORIGINAL</b><span>主体原大小与原位置</span></div>
-                <div><b>LOCAL ONLY</b><span>图片不离开本机</span></div>
+                <div><b>CLOUD MASK</b><span>fal.ai 只生成主体蒙版</span></div>
               </div>
             </div>
             """
@@ -286,6 +312,15 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
                 elem_classes=["safe-panel"],
             )
             with gr.Column(min_width=280, elem_classes=["safe-controls"]):
+                processing_engine = gr.Radio(
+                    choices=[
+                        ("云端高精度 · fal.ai 2K", "fal"),
+                        ("本地离线 · BiRefNet", "local"),
+                    ],
+                    value="fal",
+                    label="处理引擎",
+                    info="云端模式会上传原图并消耗 fal.ai 预付费额度；本地模式不会上传。",
+                )
                 quality = gr.Radio(
                     choices=[
                         ("高质量 · BiRefNet Massive", "high"),
@@ -293,7 +328,7 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
                     ],
                     value="high",
                     label="处理档位",
-                    info="高质量档约 27 秒/张；快速档约 9 秒/张（本机实测）。",
+                    info="仅本地离线模式生效；云端固定使用 2K 模型。",
                 )
                 output_format = gr.Radio(
                     choices=[("JPG", "jpg"), ("JPEG", "jpeg"), ("PNG", "png")],
@@ -397,7 +432,7 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
 
         run.click(
             fn=run_batch,
-            inputs=[files, quality, output_format, task_state],
+            inputs=[files, processing_engine, quality, output_format, task_state],
             outputs=[
                 original_gallery,
                 generated_gallery,
