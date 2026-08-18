@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,7 +42,6 @@ class DirectDownloadTests(unittest.TestCase):
 
     def process(self, output_format):
         options = BatchOptions(
-            output_size=256,
             output_format=output_format,
             correct_geometry=False,
             correct_glare=False,
@@ -65,6 +65,15 @@ class DirectDownloadTests(unittest.TestCase):
                 self.assertEqual(output_path.suffix, extension)
                 with Image.open(output_path) as output:
                     self.assertEqual(output.format, encoding)
+                    self.assertEqual(output.size, (300, 300))
+
+                manifest = json.loads(
+                    (batch.task_directory / "manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertNotIn("output_size", manifest["options"])
+                self.assertNotIn("subject_ratio", manifest["options"])
 
                 self.assertFalse((batch.task_directory / "report.csv").exists())
                 self.assertFalse(
@@ -74,7 +83,6 @@ class DirectDownloadTests(unittest.TestCase):
 
     def test_review_result_uses_review_suffix(self):
         options = BatchOptions(
-            output_size=256,
             output_format="jpeg",
             correct_geometry=False,
             correct_glare=False,
@@ -102,6 +110,7 @@ class DirectDownloadTests(unittest.TestCase):
         self.assertNotEqual(output_path.read_bytes(), before)
         with Image.open(output_path) as output:
             self.assertEqual(output.format, "PNG")
+            self.assertEqual(output.size, (300, 300))
 
 
 if __name__ == "__main__":

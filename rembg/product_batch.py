@@ -149,12 +149,7 @@ def apply_local_mask_correction(
         step = "人工恢复蒙版区域"
 
     options_data = manifest["options"]
-    output, _ = compose_white_canvas(
-        source,
-        mask,
-        int(options_data["output_size"]),
-        float(options_data["subject_ratio"]),
-    )
+    output, _ = compose_white_canvas(source, mask)
     item = manifest["items"][index]
     output_path = task / item["output_path"]
     output_format = cast(OutputFormat, options_data.get("output_format", "jpg"))
@@ -179,7 +174,7 @@ def make_comparison(source: ImageInput, result: ProcessingResult) -> PILImage:
     """Create a compact before/after card without modifying either image."""
 
     original = decode_product_image(source)
-    output = result.image or Image.new("RGB", (1000, 1000), "white")
+    output = result.image or Image.new("RGB", original.size, "white")
     card = Image.new("RGB", (1000, 540), (238, 240, 243))
     draw = ImageDraw.Draw(card)
     for column, (image, label) in enumerate(((original, "原图"), (output, "白底结果"))):
@@ -273,8 +268,6 @@ def process_product_batch(
 
         manifest = {
             "options": {
-                "output_size": options.output_size,
-                "subject_ratio": options.subject_ratio,
                 "jpeg_quality": options.jpeg_quality,
                 "output_format": options.output_format,
             },

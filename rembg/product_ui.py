@@ -266,10 +266,10 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
             <div class="safe-shell safe-hero">
               <div class="safe-kicker">SAFE PRODUCT IMAGING / LOCAL</div>
               <h1>保险柜白底主图工作台</h1>
-              <p>批量抠图、保真校正与统一排版。斜侧和开门视角保持真实；不可靠的图片自动进入复核区。</p>
+              <p>批量抠图、原位保真与必要回正。保持原图尺寸、主体大小和位置；不可靠的图片自动进入复核区。</p>
               <div class="safe-plate" aria-label="输出规格">
-                <div><b>1000 × 1000</b><span>固定方形画布</span></div>
-                <div><b>85%</b><span>主体最长边占比</span></div>
+                <div><b>1 : 1</b><span>输出尺寸跟随原图</span></div>
+                <div><b>ORIGINAL</b><span>主体原大小与原位置</span></div>
                 <div><b>LOCAL ONLY</b><span>图片不离开本机</span></div>
               </div>
             </div>
