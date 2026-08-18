@@ -155,13 +155,13 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
 
     cleanup_stale_batches()
 
-    def run_batch(files, quality, previous_task, progress=gr.Progress()):
+    def run_batch(files, quality, output_format, previous_task, progress=gr.Progress()):
         if not files:
             raise gr.Error("请先拖入 1–50 张保险柜图片。")
         if len(files) > 50:
             raise gr.Error("每批最多处理 50 张图片，请拆分后重试。")
         cleanup_batch_directory(previous_task)
-        options = BatchOptions(quality=quality)
+        options = BatchOptions(quality=quality, output_format=output_format)
         try:
             session = session_provider(options.model_name)
 
@@ -210,7 +210,7 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
             generated_gallery,
             _status_markdown(batch.counts, len(batch.items)),
             table,
-            str(batch.zip_path),
+            [str(path) for path in batch.output_paths],
             str(batch.task_directory),
         )
 
@@ -235,7 +235,7 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
             raise gr.Error("请先点击左侧“原图”中的一张图片。")
         painted = _painted_pixels(editor_value)
         try:
-            output, zip_path = apply_local_mask_correction(
+            output, download_paths = apply_local_mask_correction(
                 task_directory, int(selected_index), painted, mode
             )
             source, _, _ = load_correction_assets(task_directory, int(selected_index))
@@ -245,9 +245,9 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
         return (
             _generated_gallery_from_task(task_directory),
             output,
-            str(zip_path),
+            [str(path) for path in download_paths],
             {"background": source, "layers": [], "composite": source},
-            f"已应用人工{action}，白底图和 ZIP 已更新。",
+            f"已应用人工{action}，白底图和下载列表已更新。",
         )
 
     with gr.Blocks(
@@ -294,6 +294,12 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
                     value="high",
                     label="处理档位",
                     info="高质量档约 27 秒/张；快速档约 9 秒/张（本机实测）。",
+                )
+                output_format = gr.Radio(
+                    choices=[("JPG", "jpg"), ("JPEG", "jpeg"), ("PNG", "png")],
+                    value="jpg",
+                    label="输出格式",
+                    info="JPG/JPEG 文件更小；PNG 无损但文件较大。",
                 )
                 run = gr.Button(
                     "生成白底主图",
@@ -383,14 +389,15 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
                     "应用局部修正", variant="primary"
                 )
         gr.Markdown("### 3. 下载", elem_classes=["safe-section"])
-        download = gr.DownloadButton(
-            "下载 ZIP（成品、复核图和报告）",
-            variant="primary",
+        download = gr.File(
+            label="直接下载生成图",
+            file_count="multiple",
+            interactive=False,
         )
 
         run.click(
             fn=run_batch,
-            inputs=[files, quality, task_state],
+            inputs=[files, quality, output_format, task_state],
             outputs=[
                 original_gallery,
                 generated_gallery,

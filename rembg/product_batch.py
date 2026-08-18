@@ -1,15 +1,13 @@
-"""Sequential batch orchestration and downloadable archive creation."""
+"""Sequential batch orchestration and direct image downloads."""
 
 from __future__ import annotations
 
-import csv
 import json
 import shutil
 import tempfile
-import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Sequence, cast
 
 import cv2
 import numpy as np
@@ -19,6 +17,7 @@ from PIL.Image import Image as PILImage
 from .product_image import (
     BatchOptions,
     ImageInput,
+    OutputFormat,
     ProcessingResult,
     decode_product_image,
     process_product_image,
@@ -43,8 +42,17 @@ class BatchItem:
 @dataclass
 class BatchResult:
     task_directory: Path
-    zip_path: Path
     items: list[BatchItem] = field(default_factory=list)
+
+    @property
+    def output_paths(self) -> list[Path]:
+        return [
+            self.task_directory
+            / ("review" if item.result.status == "review" else "processed")
+            / item.output_name
+            for item in self.items
+            if item.output_name is not None
+        ]
 
     @property
     def counts(self) -> dict[str, int]:
@@ -68,47 +76,25 @@ def _safe_stem(filename: str) -> str:
     return "".join("_" if char in '\\/:*?"<>|' else char for char in stem)
 
 
-def _unique_output_name(source_name: str, suffix: str, used_names: set[str]) -> str:
+def _unique_output_name(
+    source_name: str, suffix: str, extension: str, used_names: set[str]
+) -> str:
     stem = _safe_stem(source_name)
-    candidate = f"{stem}{suffix}.jpg"
+    candidate = f"{stem}{suffix}.{extension}"
     counter = 2
     while candidate.casefold() in used_names:
-        candidate = f"{stem}{suffix}_{counter}.jpg"
+        candidate = f"{stem}{suffix}_{counter}.{extension}"
         counter += 1
     used_names.add(candidate.casefold())
     return candidate
 
 
-def _write_archive(task_directory: Path) -> Path:
-    """Build the download archive, excluding private correction assets."""
-
-    zip_path = task_directory / "safe_white_images.zip"
-    with zipfile.ZipFile(
-        zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
-    ) as archive:
-        for directory_name in ("processed", "review"):
-            directory = task_directory / directory_name
-            files = sorted(directory.iterdir())
-            if not files:
-                archive.writestr(f"{directory.name}/", "")
-            for file_path in files:
-                archive.write(file_path, f"{directory.name}/{file_path.name}")
-        archive.write(task_directory / "report.csv", "report.csv")
-    return zip_path
-
-
-def _append_report_step(task_directory: Path, source_name: str, step: str) -> None:
-    report_path = task_directory / "report.csv"
-    with report_path.open("r", newline="", encoding="utf-8-sig") as report_file:
-        rows = list(csv.reader(report_file))
-    for row in rows[1:]:
-        if row and row[0] == source_name:
-            existing = row[5] if len(row) > 5 else ""
-            if step not in existing:
-                row[5] = "；".join(value for value in (existing, step) if value)
-            break
-    with report_path.open("w", newline="", encoding="utf-8-sig") as report_file:
-        csv.writer(report_file).writerows(rows)
+def _download_paths_from_manifest(task: Path, manifest: dict) -> list[Path]:
+    return [
+        task / item["output_path"]
+        for item in manifest["items"]
+        if item.get("output_path")
+    ]
 
 
 def load_correction_assets(
@@ -135,8 +121,8 @@ def apply_local_mask_correction(
     index: int,
     painted_mask: np.ndarray,
     mode: str,
-) -> tuple[PILImage, Path]:
-    """Apply a user-painted delete/restore mask and rebuild the local ZIP."""
+) -> tuple[PILImage, list[Path]]:
+    """Apply a user-painted delete/restore mask and refresh direct downloads."""
 
     if mode not in {"delete", "restore"}:
         raise ValueError("修正模式必须是 delete 或 restore")
@@ -171,16 +157,22 @@ def apply_local_mask_correction(
     )
     item = manifest["items"][index]
     output_path = task / item["output_path"]
+    output_format = cast(OutputFormat, options_data.get("output_format", "jpg"))
     output_path.write_bytes(
-        ProcessingResult(image=output, status="processed").to_jpeg_bytes(
-            int(options_data["jpeg_quality"])
+        ProcessingResult(image=output, status="processed").to_image_bytes(
+            output_format, int(options_data["jpeg_quality"])
         )
     )
     Image.fromarray(mask, mode="L").save(
         task / EDIT_DIRECTORY_NAME / f"mask_{index:03d}.png"
     )
-    _append_report_step(task, item["source_name"], step)
-    return output, _write_archive(task)
+    correction_steps = item.setdefault("correction_steps", [])
+    if step not in correction_steps:
+        correction_steps.append(step)
+        (task / MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    return output, _download_paths_from_manifest(task, manifest)
 
 
 def make_comparison(source: ImageInput, result: ProcessingResult) -> PILImage:
@@ -205,7 +197,7 @@ def process_product_batch(
     session: BaseSession,
     progress: ProgressCallback | None = None,
 ) -> BatchResult:
-    """Process up to fifty images and package outputs plus an audit report."""
+    """Process up to fifty images and expose successful outputs directly."""
 
     if not inputs:
         raise ValueError("请至少选择一张图片")
@@ -241,62 +233,50 @@ def process_product_batch(
             output_name: str | None = None
             if result.image is not None:
                 suffix = "_white" if result.status == "processed" else "_review"
-                output_name = _unique_output_name(source_name, suffix, used_names)
+                output_name = _unique_output_name(
+                    source_name, suffix, options.output_format, used_names
+                )
                 destination_directory = (
                     processed_directory
                     if result.status == "processed"
                     else review_directory
                 )
-                (destination_directory / output_name).write_bytes(
-                    result.to_jpeg_bytes(options.jpeg_quality)
-                )
-                if result.working_image is not None and result.working_mask is not None:
-                    Image.fromarray(result.working_image, mode="RGB").save(
-                        edit_directory / f"source_{index - 1:03d}.png",
-                        optimize=True,
+                destination = destination_directory / output_name
+                try:
+                    destination.write_bytes(
+                        result.to_image_bytes(
+                            options.output_format, options.jpeg_quality
+                        )
                     )
-                    Image.fromarray(result.working_mask, mode="L").save(
-                        edit_directory / f"mask_{index - 1:03d}.png",
-                        optimize=True,
-                    )
+                    if (
+                        result.working_image is not None
+                        and result.working_mask is not None
+                    ):
+                        Image.fromarray(result.working_image, mode="RGB").save(
+                            edit_directory / f"source_{index - 1:03d}.png",
+                            optimize=True,
+                        )
+                        Image.fromarray(result.working_mask, mode="L").save(
+                            edit_directory / f"mask_{index - 1:03d}.png",
+                            optimize=True,
+                        )
+                except Exception as exc:
+                    destination.unlink(missing_ok=True)
+                    result.status = "failed"
+                    result.error = f"输出图片写入失败：{exc}"
+                    result.image = None
+                    output_name = None
+                finally:
                     result.working_image = None
                     result.working_mask = None
             items.append(BatchItem(source_name, output_name, result))
-
-        report_path = task_directory / "report.csv"
-        with report_path.open("w", newline="", encoding="utf-8-sig") as report_file:
-            writer = csv.writer(report_file)
-            writer.writerow(
-                [
-                    "原文件名",
-                    "输出文件名",
-                    "状态",
-                    "质量档",
-                    "耗时（秒）",
-                    "处理步骤",
-                    "警告或错误",
-                ]
-            )
-            for item in items:
-                result = item.result
-                issue = result.error or "；".join(result.warnings)
-                writer.writerow(
-                    [
-                        item.source_name,
-                        item.output_name or "",
-                        result.status,
-                        options.quality,
-                        f"{result.elapsed_seconds:.2f}",
-                        "；".join(result.applied_steps),
-                        issue,
-                    ]
-                )
 
         manifest = {
             "options": {
                 "output_size": options.output_size,
                 "subject_ratio": options.subject_ratio,
                 "jpeg_quality": options.jpeg_quality,
+                "output_format": options.output_format,
             },
             "items": [
                 {
@@ -320,11 +300,10 @@ def process_product_batch(
         (task_directory / MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        zip_path = _write_archive(task_directory)
 
         if progress:
             progress(total, total, "处理完成")
-        return BatchResult(task_directory, zip_path, items)
+        return BatchResult(task_directory, items)
     except Exception:
         cleanup_batch_directory(task_directory)
         raise

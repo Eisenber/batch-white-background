@@ -21,6 +21,7 @@ from PIL.Image import Image as PILImage
 from .sessions.base import BaseSession
 
 QualityPreset = Literal["high", "fast"]
+OutputFormat = Literal["jpg", "jpeg", "png"]
 ResultStatus = Literal["processed", "review", "failed"]
 ImageInput = Union[bytes, bytearray, str, Path, PILImage]
 
@@ -33,6 +34,7 @@ class BatchOptions:
     output_size: int = 1000
     subject_ratio: float = 0.85
     jpeg_quality: int = 95
+    output_format: OutputFormat = "jpg"
     correct_geometry: bool = True
     correct_glare: bool = True
 
@@ -49,6 +51,8 @@ class BatchOptions:
             raise ValueError("subject_ratio must be between 0.2 and 0.95")
         if not 75 <= self.jpeg_quality <= 100:
             raise ValueError("jpeg_quality must be between 75 and 100")
+        if self.output_format not in ("jpg", "jpeg", "png"):
+            raise ValueError("output_format must be 'jpg', 'jpeg', or 'png'")
 
 
 @dataclass
@@ -67,13 +71,25 @@ class ProcessingResult:
     working_image: np.ndarray | None = field(default=None, repr=False)
     working_mask: np.ndarray | None = field(default=None, repr=False)
 
-    def to_jpeg_bytes(self, quality: int = 95) -> bytes:
+    def to_image_bytes(
+        self, output_format: OutputFormat = "jpg", jpeg_quality: int = 95
+    ) -> bytes:
         if self.image is None:
             raise ValueError("failed results do not contain an output image")
         output = io.BytesIO()
-        self.image.convert("RGB").save(
-            output, format="JPEG", quality=quality, subsampling=0, optimize=True
-        )
+        image = self.image.convert("RGB")
+        if output_format in ("jpg", "jpeg"):
+            image.save(
+                output,
+                format="JPEG",
+                quality=jpeg_quality,
+                subsampling=0,
+                optimize=True,
+            )
+        elif output_format == "png":
+            image.save(output, format="PNG", optimize=True)
+        else:
+            raise ValueError("output_format must be 'jpg', 'jpeg', or 'png'")
         return output.getvalue()
 
 
