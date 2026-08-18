@@ -1,8 +1,8 @@
-"""Faithful product-photo processing for safe and lockbox catalog images.
+"""Product-photo processing for safe and lockbox catalog images.
 
-The functions in this module deliberately avoid generative reconstruction.  A
-correction is only applied when it can be inferred from pixels already present
-in the photograph; uncertain cases are returned with a review warning.
+The local path deliberately avoids generative reconstruction. The optional
+OpenAI path is isolated behind a complete-image generator and always returns a
+review warning because generated pixels can alter product details.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from .sessions.base import BaseSession
 
 QualityPreset = Literal["high", "fast"]
 OutputFormat = Literal["jpg", "jpeg", "png"]
-ProcessingEngine = Literal["local", "fal"]
+ProcessingEngine = Literal["local", "openai"]
 ResultStatus = Literal["processed", "review", "failed"]
 ImageInput = Union[bytes, bytearray, str, Path, PILImage]
 
@@ -40,15 +40,15 @@ class BatchOptions:
 
     @property
     def model_name(self) -> str:
-        if self.processing_engine == "fal":
-            return "fal.ai BiRefNet Light 2K"
+        if self.processing_engine == "openai":
+            return "gpt-image-2"
         return "birefnet-massive" if self.quality == "high" else "u2net"
 
     def validate(self) -> None:
         if self.quality not in ("high", "fast"):
             raise ValueError("quality must be 'high' or 'fast'")
-        if self.processing_engine not in ("local", "fal"):
-            raise ValueError("processing_engine must be 'local' or 'fal'")
+        if self.processing_engine not in ("local", "openai"):
+            raise ValueError("processing_engine must be 'local' or 'openai'")
         if not 75 <= self.jpeg_quality <= 100:
             raise ValueError("jpeg_quality must be between 75 and 100")
         if self.output_format not in ("jpg", "jpeg", "png"):
@@ -91,6 +91,24 @@ class ProcessingResult:
         else:
             raise ValueError("output_format must be 'jpg', 'jpeg', or 'png'")
         return output.getvalue()
+
+
+@dataclass(frozen=True)
+class GeneratedProductImage:
+    """A complete generated result plus geometry needed for auditing."""
+
+    image: PILImage
+    model: str
+    requested_width: int
+    requested_height: int
+    returned_width: int
+    returned_height: int
+
+
+class ProductImageGenerator(Protocol):
+    """Generate one complete product image instead of a segmentation mask."""
+
+    def generate(self, image: PILImage) -> GeneratedProductImage: ...
 
 
 class CloudEnhancer(Protocol):
@@ -685,6 +703,64 @@ def process_product_image(
             status="failed",
             applied_steps=steps,
             warnings=warnings,
+            metrics=metrics,
+            elapsed_seconds=time.perf_counter() - started,
+            error=str(exc),
+        )
+
+
+def process_generated_product_image(
+    image: ImageInput,
+    options: BatchOptions,
+    generator: ProductImageGenerator,
+) -> ProcessingResult:
+    """Generate a full white-background image and restore source dimensions."""
+
+    started = time.perf_counter()
+    options.validate()
+    steps = ["方向与颜色标准化"]
+    warnings = ["GPT 生成结果需人工复核文字、按键、锁具和表面细节"]
+    metrics: dict[str, float | str] = {}
+
+    try:
+        if options.processing_engine != "openai":
+            raise ValueError("完整图片生成仅支持 openai 处理引擎")
+        source = decode_product_image(image)
+        metrics["source_width"] = float(source.width)
+        metrics["source_height"] = float(source.height)
+        generated = generator.generate(source)
+        output = generated.image.convert("RGB")
+        metrics.update(
+            {
+                "model": generated.model,
+                "requested_width": float(generated.requested_width),
+                "requested_height": float(generated.requested_height),
+                "returned_width": float(generated.returned_width),
+                "returned_height": float(generated.returned_height),
+            }
+        )
+        steps.append("GPT Image 2 高质量白底生成")
+        resized = output.size != source.size
+        if resized:
+            output = output.resize(source.size, Image.Resampling.LANCZOS)
+            steps.append("恢复原图尺寸")
+        metrics["resized_to_source"] = float(resized)
+        metrics["final_width"] = float(output.width)
+        metrics["final_height"] = float(output.height)
+        return ProcessingResult(
+            image=output,
+            status="review",
+            applied_steps=steps,
+            warnings=warnings,
+            metrics=metrics,
+            elapsed_seconds=time.perf_counter() - started,
+        )
+    except Exception as exc:
+        return ProcessingResult(
+            image=None,
+            status="failed",
+            applied_steps=steps,
+            warnings=[],
             metrics=metrics,
             elapsed_seconds=time.perf_counter() - started,
             error=str(exc),

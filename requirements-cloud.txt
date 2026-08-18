@@ -1,2 +1,0 @@
-# fal.ai queue calls use the same HTTP client family as the Gradio application.
-httpx>=0.27,<1

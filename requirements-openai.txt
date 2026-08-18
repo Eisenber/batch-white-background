@@ -1,0 +1,2 @@
+# OpenAI GPT Image 2 high-quality generation mode.
+openai>=3.2,<4
