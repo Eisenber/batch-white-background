@@ -1,8 +1,8 @@
-"""Faithful product-photo processing for safe and lockbox catalog images.
+"""Product-photo processing for safe and lockbox catalog images.
 
-The functions in this module deliberately avoid generative reconstruction.  A
-correction is only applied when it can be inferred from pixels already present
-in the photograph; uncertain cases are returned with a review warning.
+The local path deliberately avoids generative reconstruction. The optional
+OpenAI path is isolated behind a complete-image generator and always returns a
+review warning because generated pixels can alter product details.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from .sessions.base import BaseSession
 
 QualityPreset = Literal["high", "fast"]
 OutputFormat = Literal["jpg", "jpeg", "png"]
+ProcessingEngine = Literal["local", "openai"]
 ResultStatus = Literal["processed", "review", "failed"]
 ImageInput = Union[bytes, bytearray, str, Path, PILImage]
 
@@ -31,8 +32,7 @@ class BatchOptions:
     """Stable options shared by the web UI and programmatic callers."""
 
     quality: QualityPreset = "high"
-    output_size: int = 1000
-    subject_ratio: float = 0.85
+    processing_engine: ProcessingEngine = "local"
     jpeg_quality: int = 95
     output_format: OutputFormat = "jpg"
     correct_geometry: bool = True
@@ -40,15 +40,15 @@ class BatchOptions:
 
     @property
     def model_name(self) -> str:
+        if self.processing_engine == "openai":
+            return "gpt-image-2"
         return "birefnet-massive" if self.quality == "high" else "u2net"
 
     def validate(self) -> None:
         if self.quality not in ("high", "fast"):
             raise ValueError("quality must be 'high' or 'fast'")
-        if self.output_size < 256:
-            raise ValueError("output_size must be at least 256 pixels")
-        if not 0.2 <= self.subject_ratio <= 0.95:
-            raise ValueError("subject_ratio must be between 0.2 and 0.95")
+        if self.processing_engine not in ("local", "openai"):
+            raise ValueError("processing_engine must be 'local' or 'openai'")
         if not 75 <= self.jpeg_quality <= 100:
             raise ValueError("jpeg_quality must be between 75 and 100")
         if self.output_format not in ("jpg", "jpeg", "png"):
@@ -63,7 +63,7 @@ class ProcessingResult:
     status: ResultStatus
     applied_steps: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, float | str] = field(default_factory=dict)
     elapsed_seconds: float = 0.0
     error: str | None = None
     # Aligned source pixels and alpha are retained only long enough for the
@@ -91,6 +91,24 @@ class ProcessingResult:
         else:
             raise ValueError("output_format must be 'jpg', 'jpeg', or 'png'")
         return output.getvalue()
+
+
+@dataclass(frozen=True)
+class GeneratedProductImage:
+    """A complete generated result plus geometry needed for auditing."""
+
+    image: PILImage
+    model: str
+    requested_width: int
+    requested_height: int
+    returned_width: int
+    returned_height: int
+
+
+class ProductImageGenerator(Protocol):
+    """Generate one complete product image instead of a segmentation mask."""
+
+    def generate(self, image: PILImage) -> GeneratedProductImage: ...
 
 
 class CloudEnhancer(Protocol):
@@ -346,7 +364,8 @@ def _rotation_angle(
         return 0.0, 0.0
 
     candidates: list[tuple[float, float]] = []
-    for x1, y1, x2, y2 in lines[:, 0]:
+    # OpenCV 5 returns lines as (N, 4); OpenCV 4 wrapped them as (N, 1, 4).
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
         dx, dy = float(x2 - x1), float(y2 - y1)
         length = float(np.hypot(dx, dy))
         angle = float(np.degrees(np.arctan2(dy, dx)))
@@ -370,20 +389,34 @@ def _rotation_angle(
 
 
 def _rotate_pair(
-    image: np.ndarray, mask: np.ndarray, angle: float
-) -> tuple[np.ndarray, np.ndarray]:
+    image: np.ndarray, mask: np.ndarray, angle: float, margin: int = 2
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Rotate around the subject centre on the original canvas when safe."""
+
     height, width = image.shape[:2]
-    center = (width / 2.0, height / 2.0)
+    support = mask >= 12
+    if not support.any():
+        return image, mask, False
+    ys, xs = np.where(support)
+    x0, x1 = float(xs.min()), float(xs.max())
+    y0, y1 = float(ys.min()), float(ys.max())
+    center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
     matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-    cosine, sine = abs(matrix[0, 0]), abs(matrix[0, 1])
-    new_width = int(height * sine + width * cosine)
-    new_height = int(height * cosine + width * sine)
-    matrix[0, 2] += new_width / 2.0 - center[0]
-    matrix[1, 2] += new_height / 2.0 - center[1]
+    corners = np.array(
+        [[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]], dtype=np.float32
+    )
+    transformed = cv2.transform(corners, matrix)[0]
+    if (
+        transformed[:, 0].min() < margin
+        or transformed[:, 1].min() < margin
+        or transformed[:, 0].max() > width - 1 - margin
+        or transformed[:, 1].max() > height - 1 - margin
+    ):
+        return image, mask, False
     rotated_image = cv2.warpAffine(
         image,
         matrix,
-        (new_width, new_height),
+        (width, height),
         flags=cv2.INTER_LANCZOS4,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(255, 255, 255),
@@ -391,12 +424,12 @@ def _rotate_pair(
     rotated_mask = cv2.warpAffine(
         mask,
         matrix,
-        (new_width, new_height),
+        (width, height),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
-    return rotated_image, rotated_mask
+    return rotated_image, rotated_mask, True
 
 
 def _safe_perspective_correction(
@@ -524,47 +557,51 @@ def _correct_glare(
     return corrected, highlight_ratio, clipped_ratio
 
 
+def _refine_mask_edge(mask: np.ndarray) -> tuple[np.ndarray, float, bool]:
+    """Tighten an unusually broad soft fringe without moving its midpoint."""
+
+    binary = (mask >= 128).astype(np.uint8)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    perimeter = sum(cv2.arcLength(contour, True) for contour in contours)
+    semi_transparent = (mask > 0) & (mask < 255)
+    estimated_width = float(semi_transparent.sum() / max(perimeter, 1.0))
+    if estimated_width <= 2.0:
+        return mask, estimated_width, False
+
+    alpha = mask.astype(np.float32) / 255.0
+    normalized = np.clip((alpha - 0.25) / 0.5, 0.0, 1.0)
+    refined = normalized * normalized * (3.0 - 2.0 * normalized)
+    return np.rint(refined * 255.0).astype(np.uint8), estimated_width, True
+
+
 def compose_white_canvas(
-    image: np.ndarray,
-    mask: np.ndarray,
-    output_size: int = 1000,
-    subject_ratio: float = 0.85,
+    image: np.ndarray, mask: np.ndarray
 ) -> tuple[PILImage, dict[str, float]]:
+    """Composite aligned source pixels over white without crop or resize."""
+
+    if image.shape[:2] != mask.shape:
+        raise ValueError("Image and mask dimensions must match")
     support = mask >= 12
     if not support.any():
         raise ValueError("No foreground subject was detected")
 
+    refined_mask, fringe_width, edge_refined = _refine_mask_edge(mask)
     ys, xs = np.where(support)
     x0, x1 = int(xs.min()), int(xs.max()) + 1
     y0, y1 = int(ys.min()), int(ys.max()) + 1
-    crop_image = image[y0:y1, x0:x1]
-    crop_alpha = mask[y0:y1, x0:x1]
-    crop_height, crop_width = crop_image.shape[:2]
-
-    target = int(round(output_size * subject_ratio))
-    scale = target / max(crop_width, crop_height)
-    new_width = max(1, int(round(crop_width * scale)))
-    new_height = max(1, int(round(crop_height * scale)))
-    resized_image = cv2.resize(
-        crop_image, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4
-    )
-    resized_alpha = (
-        cv2.resize(
-            crop_alpha, (new_width, new_height), interpolation=cv2.INTER_LINEAR
-        ).astype(np.float32)[:, :, None]
-        / 255.0
-    )
-
-    canvas = np.full((output_size, output_size, 3), 255, dtype=np.float32)
-    left = (output_size - new_width) // 2
-    top = (output_size - new_height) // 2
-    region = canvas[top : top + new_height, left : left + new_width]
-    region[:] = resized_image * resized_alpha + 255.0 * (1.0 - resized_alpha)
+    alpha = refined_mask.astype(np.float32)[:, :, None] / 255.0
+    canvas = image.astype(np.float32) * alpha + 255.0 * (1.0 - alpha)
     output = Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), mode="RGB")
     return output, {
-        "output_subject_width": float(new_width),
-        "output_subject_height": float(new_height),
-        "output_subject_scale": float(scale),
+        "output_width": float(image.shape[1]),
+        "output_height": float(image.shape[0]),
+        "output_subject_width": float(x1 - x0),
+        "output_subject_height": float(y1 - y0),
+        "output_subject_center_x": float((x0 + x1 - 1) / 2.0),
+        "output_subject_center_y": float((y0 + y1 - 1) / 2.0),
+        "output_subject_scale": 1.0,
+        "mask_soft_fringe_width": fringe_width,
+        "mask_edge_refined": float(edge_refined),
     }
 
 
@@ -573,13 +610,13 @@ def process_product_image(
     options: BatchOptions,
     session: BaseSession,
 ) -> ProcessingResult:
-    """Create a faithful square white-background product image."""
+    """Create a source-sized, position-preserving white-background image."""
 
     started = time.perf_counter()
     options.validate()
     steps = ["方向与颜色标准化"]
     warnings: list[str] = []
-    metrics: dict[str, float] = {}
+    metrics: dict[str, float | str] = {}
 
     try:
         source = decode_product_image(image)
@@ -588,10 +625,15 @@ def process_product_image(
         if not masks:
             raise ValueError("Background-removal model returned no mask")
         mask = np.asarray(masks[0].convert("L"), dtype=np.uint8)
+        metrics["mask_returned_width"] = float(mask.shape[1])
+        metrics["mask_returned_height"] = float(mask.shape[0])
         if mask.shape != rgb.shape[:2]:
             mask = cv2.resize(
                 mask, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR
             )
+            metrics["mask_resized_to_source"] = 1.0
+        else:
+            metrics["mask_resized_to_source"] = 0.0
         mask, component_count = _largest_mask(mask)
         metrics["mask_component_count"] = float(component_count)
         steps.append(f"主体分割（{options.model_name}）")
@@ -618,21 +660,18 @@ def process_product_image(
             angle, support = _rotation_angle(rgb, mask)
             metrics["rotation_line_support"] = support
             metrics["rotation_degrees"] = angle
+            metrics["rotation_status"] = "not_needed"
             if angle:
-                rgb, mask = _rotate_pair(rgb, mask, angle)
-                steps.append(f"画面旋转校正（{angle:+.2f}°）")
-
-            rgb, mask, displacement = _safe_perspective_correction(rgb, mask)
-            metrics["perspective_displacement"] = displacement
-            if displacement:
-                steps.append("正面轻度梯形校正")
-
-            final_angle, final_support = _rotation_angle(rgb, mask, minimum_angle=0.25)
-            metrics["final_rotation_line_support"] = final_support
-            metrics["final_rotation_degrees"] = final_angle
-            if final_angle:
-                rgb, mask = _rotate_pair(rgb, mask, final_angle)
-                steps.append(f"生成图最终回正（{final_angle:+.2f}°）")
+                rgb, mask, rotated = _rotate_pair(rgb, mask, angle)
+                if rotated:
+                    metrics["rotation_status"] = "applied"
+                    steps.append(f"主体原位回正（{angle:+.2f}°）")
+                else:
+                    metrics["rotation_status"] = "skipped_clipping_risk"
+                    metrics["rotation_clipping_risk"] = 1.0
+                    warnings.append("主体靠近边缘，为避免裁切已跳过自动回正")
+        else:
+            metrics["rotation_status"] = "disabled"
 
         if options.correct_glare:
             rgb, highlight_ratio, clipped_ratio = _correct_glare(rgb, mask)
@@ -643,11 +682,11 @@ def process_product_image(
             if clipped_ratio > 0.012:
                 warnings.append("存在较大过曝区域，缺失纹理无法可靠恢复")
 
-        output, compose_metrics = compose_white_canvas(
-            rgb, mask, options.output_size, options.subject_ratio
-        )
+        output, compose_metrics = compose_white_canvas(rgb, mask)
         metrics.update(compose_metrics)
-        steps.append("纯白方图排版")
+        if compose_metrics["mask_edge_refined"]:
+            steps.append("蒙版边缘收紧")
+        steps.append("原尺寸原位置白底合成")
         status: ResultStatus = "review" if warnings else "processed"
         return ProcessingResult(
             image=output,
@@ -665,6 +704,64 @@ def process_product_image(
             status="failed",
             applied_steps=steps,
             warnings=warnings,
+            metrics=metrics,
+            elapsed_seconds=time.perf_counter() - started,
+            error=str(exc),
+        )
+
+
+def process_generated_product_image(
+    image: ImageInput,
+    options: BatchOptions,
+    generator: ProductImageGenerator,
+) -> ProcessingResult:
+    """Generate a full white-background image and restore source dimensions."""
+
+    started = time.perf_counter()
+    options.validate()
+    steps = ["方向与颜色标准化"]
+    warnings = ["GPT 生成结果需人工复核文字、按键、锁具和表面细节"]
+    metrics: dict[str, float | str] = {}
+
+    try:
+        if options.processing_engine != "openai":
+            raise ValueError("完整图片生成仅支持 openai 处理引擎")
+        source = decode_product_image(image)
+        metrics["source_width"] = float(source.width)
+        metrics["source_height"] = float(source.height)
+        generated = generator.generate(source)
+        output = generated.image.convert("RGB")
+        metrics.update(
+            {
+                "model": generated.model,
+                "requested_width": float(generated.requested_width),
+                "requested_height": float(generated.requested_height),
+                "returned_width": float(generated.returned_width),
+                "returned_height": float(generated.returned_height),
+            }
+        )
+        steps.append("GPT Image 2 高质量白底生成")
+        resized = output.size != source.size
+        if resized:
+            output = output.resize(source.size, Image.Resampling.LANCZOS)
+            steps.append("恢复原图尺寸")
+        metrics["resized_to_source"] = float(resized)
+        metrics["final_width"] = float(output.width)
+        metrics["final_height"] = float(output.height)
+        return ProcessingResult(
+            image=output,
+            status="review",
+            applied_steps=steps,
+            warnings=warnings,
+            metrics=metrics,
+            elapsed_seconds=time.perf_counter() - started,
+        )
+    except Exception as exc:
+        return ProcessingResult(
+            image=None,
+            status="failed",
+            applied_steps=steps,
+            warnings=[],
             metrics=metrics,
             elapsed_seconds=time.perf_counter() - started,
             error=str(exc),

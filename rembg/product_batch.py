@@ -18,8 +18,10 @@ from .product_image import (
     BatchOptions,
     ImageInput,
     OutputFormat,
+    ProductImageGenerator,
     ProcessingResult,
     decode_product_image,
+    process_generated_product_image,
     process_product_image,
     compose_white_canvas,
 )
@@ -149,12 +151,7 @@ def apply_local_mask_correction(
         step = "人工恢复蒙版区域"
 
     options_data = manifest["options"]
-    output, _ = compose_white_canvas(
-        source,
-        mask,
-        int(options_data["output_size"]),
-        float(options_data["subject_ratio"]),
-    )
+    output, _ = compose_white_canvas(source, mask)
     item = manifest["items"][index]
     output_path = task / item["output_path"]
     output_format = cast(OutputFormat, options_data.get("output_format", "jpg"))
@@ -179,7 +176,7 @@ def make_comparison(source: ImageInput, result: ProcessingResult) -> PILImage:
     """Create a compact before/after card without modifying either image."""
 
     original = decode_product_image(source)
-    output = result.image or Image.new("RGB", (1000, 1000), "white")
+    output = result.image or Image.new("RGB", original.size, "white")
     card = Image.new("RGB", (1000, 540), (238, 240, 243))
     draw = ImageDraw.Draw(card)
     for column, (image, label) in enumerate(((original, "原图"), (output, "白底结果"))):
@@ -194,13 +191,16 @@ def make_comparison(source: ImageInput, result: ProcessingResult) -> PILImage:
 def process_product_batch(
     inputs: Sequence[ImageInput],
     options: BatchOptions,
-    session: BaseSession,
+    session: BaseSession | ProductImageGenerator,
     progress: ProgressCallback | None = None,
 ) -> BatchResult:
     """Process up to fifty images and expose successful outputs directly."""
 
     if not inputs:
         raise ValueError("请至少选择一张图片")
+    options.validate()
+    if options.processing_engine == "openai" and len(inputs) > 10:
+        raise ValueError("GPT Image 2 模式每批最多处理 10 张图片")
     if len(inputs) > 50:
         raise ValueError("每批最多处理 50 张图片")
     unsupported = [
@@ -211,8 +211,6 @@ def process_product_batch(
     ]
     if unsupported:
         raise ValueError("仅支持 PNG、JPEG/JPG 图片：" + "、".join(unsupported[:3]))
-    options.validate()
-
     task_directory = Path(tempfile.mkdtemp(prefix="rembg-safe-batch-"))
     processed_directory = task_directory / "processed"
     review_directory = task_directory / "review"
@@ -229,7 +227,18 @@ def process_product_batch(
             source_name = _source_name(source, index)
             if progress:
                 progress(index - 1, total, source_name)
-            result = process_product_image(source, options, session)
+            if options.processing_engine == "openai":
+                result = process_generated_product_image(
+                    source,
+                    options,
+                    cast(ProductImageGenerator, session),
+                )
+            else:
+                result = process_product_image(
+                    source,
+                    options,
+                    cast(BaseSession, session),
+                )
             output_name: str | None = None
             if result.image is not None:
                 suffix = "_white" if result.status == "processed" else "_review"
@@ -273,8 +282,7 @@ def process_product_batch(
 
         manifest = {
             "options": {
-                "output_size": options.output_size,
-                "subject_ratio": options.subject_ratio,
+                "processing_engine": options.processing_engine,
                 "jpeg_quality": options.jpeg_quality,
                 "output_format": options.output_format,
             },
@@ -289,6 +297,9 @@ def process_product_batch(
                         else None
                     ),
                     "status": item.result.status,
+                    "applied_steps": item.result.applied_steps,
+                    "warnings": item.result.warnings,
+                    "metrics": item.result.metrics,
                     "editable": bool(
                         item.output_name
                         and (edit_directory / f"source_{index:03d}.png").exists()

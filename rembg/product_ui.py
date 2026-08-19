@@ -18,6 +18,7 @@ from .product_batch import (
     process_product_batch,
 )
 from .product_image import BatchOptions, decode_product_image
+from .openai_image import OpenAIImageSession
 from .sessions.base import BaseSession
 
 
@@ -155,17 +156,44 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
 
     cleanup_stale_batches()
 
-    def run_batch(files, quality, output_format, previous_task, progress=gr.Progress()):
+    def run_batch(
+        files,
+        processing_engine,
+        quality,
+        output_format,
+        previous_task,
+        progress=gr.Progress(),
+    ):
         if not files:
             raise gr.Error("请先拖入 1–50 张保险柜图片。")
+        if processing_engine == "openai" and len(files) > 10:
+            raise gr.Error("GPT Image 2 模式每批最多处理 10 张图片，请拆分后重试。")
         if len(files) > 50:
             raise gr.Error("每批最多处理 50 张图片，请拆分后重试。")
         cleanup_batch_directory(previous_task)
-        options = BatchOptions(quality=quality, output_format=output_format)
+        options = BatchOptions(
+            quality=quality,
+            processing_engine=processing_engine,
+            output_format=output_format,
+        )
         try:
-            session = session_provider(options.model_name)
+            current = {"done": 0, "total": len(files), "filename": ""}
+
+            def generated_stage(message: str) -> None:
+                filename = current["filename"]
+                progress(
+                    (current["done"], current["total"]),
+                    desc=f"{filename} · {message}" if filename else message,
+                )
+
+            session = (
+                OpenAIImageSession(stage_callback=generated_stage)
+                if processing_engine == "openai"
+                else session_provider(options.model_name)
+            )
 
             def update(done: int, total: int, filename: str) -> None:
+                current.update(done=done, total=total, filename=filename)
                 progress(
                     (done, total),
                     desc=f"正在处理：{filename}" if done < total else filename,
@@ -190,10 +218,15 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
                 (decode_product_image(source), f"原图 · {item.source_name}")
             )
             if result.image is not None:
+                result_label = (
+                    "GPT 成品 · 需人工复核"
+                    if processing_engine == "openai"
+                    else status_labels[result.status]
+                )
                 generated_gallery.append(
                     (
                         result.image,
-                        f"{status_labels[result.status]} · {item.source_name}",
+                        f"{result_label} · {item.source_name}",
                     )
                 )
             table.append(
@@ -264,13 +297,13 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
         gr.HTML(
             """
             <div class="safe-shell safe-hero">
-              <div class="safe-kicker">SAFE PRODUCT IMAGING / LOCAL</div>
+              <div class="safe-kicker">SAFE PRODUCT IMAGING / LOCAL + GPT</div>
               <h1>保险柜白底主图工作台</h1>
-              <p>批量抠图、保真校正与统一排版。斜侧和开门视角保持真实；不可靠的图片自动进入复核区。</p>
+              <p>默认本地原像素合成；需要更自然的白底效果时，可手动选择 GPT Image 2 高质量生成。最终下载尺寸始终跟随原图。</p>
               <div class="safe-plate" aria-label="输出规格">
-                <div><b>1000 × 1000</b><span>固定方形画布</span></div>
-                <div><b>85%</b><span>主体最长边占比</span></div>
-                <div><b>LOCAL ONLY</b><span>图片不离开本机</span></div>
+                <div><b>1 : 1</b><span>输出尺寸跟随原图</span></div>
+                <div><b>LOCAL</b><span>默认离线且不上传</span></div>
+                <div><b>GPT IMAGE 2</b><span>高质量生成需人工复核</span></div>
               </div>
             </div>
             """
@@ -286,6 +319,15 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
                 elem_classes=["safe-panel"],
             )
             with gr.Column(min_width=280, elem_classes=["safe-controls"]):
+                processing_engine = gr.Radio(
+                    choices=[
+                        ("本地离线 · BiRefNet", "local"),
+                        ("高质量生成 · GPT Image 2", "openai"),
+                    ],
+                    value="local",
+                    label="处理引擎",
+                    info="GPT 模式每批最多 10 张，会上传原图并消耗 OpenAI API 额度；本地模式最多 50 张且不上传。",
+                )
                 quality = gr.Radio(
                     choices=[
                         ("高质量 · BiRefNet Massive", "high"),
@@ -293,7 +335,11 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
                     ],
                     value="high",
                     label="处理档位",
-                    info="高质量档约 27 秒/张；快速档约 9 秒/张（本机实测）。",
+                    info="仅本地离线模式生效；GPT 模式固定使用高质量编辑。",
+                )
+                gr.Markdown(
+                    "⚠️ **GPT Image 2 是生成式编辑。** 可能轻微改变产品文字、"
+                    "数字按键、指纹锁、锁具或表面纹理；每张结果必须人工复核。"
                 )
                 output_format = gr.Radio(
                     choices=[("JPG", "jpg"), ("JPEG", "jpeg"), ("PNG", "png")],
@@ -351,7 +397,7 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
         )
         with gr.Accordion("局部细节修正（可选）", open=False):
             gr.Markdown(
-                "点击上方左侧的一张 **原图**，然后在下方涂抹误保留或误删除的区域。"
+                "仅适用于本地模式结果。点击上方左侧的一张 **原图**，然后在下方涂抹误保留或误删除的区域。"
                 "应用修正只会更新蒙版，不会重新运行抠图模型。"
             )
             correction_status = gr.Markdown("尚未选择图片。")
@@ -397,7 +443,7 @@ def create_product_ui(session_provider: SessionProvider) -> gr.Blocks:
 
         run.click(
             fn=run_batch,
-            inputs=[files, quality, output_format, task_state],
+            inputs=[files, processing_engine, quality, output_format, task_state],
             outputs=[
                 original_gallery,
                 generated_gallery,
