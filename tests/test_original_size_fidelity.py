@@ -9,6 +9,7 @@ from rembg.product_image import (
     BatchOptions,
     _refine_mask_edge,
     _rotate_pair,
+    _rotation_angle,
     compose_white_canvas,
     process_product_image,
 )
@@ -83,6 +84,28 @@ class OriginalSizeFidelityTests(unittest.TestCase):
         self.assertEqual(rotated_mask.shape, mask.shape)
         self.assertLessEqual(abs(after_center[0] - before_center[0]), 1.0)
         self.assertLessEqual(abs(after_center[1] - before_center[1]), 1.0)
+
+    @patch("rembg.product_image.cv2.HoughLinesP")
+    def test_rotation_angle_accepts_flat_opencv5_hough_lines(self, hough_lines):
+        image = np.full((200, 300, 3), 128, dtype=np.uint8)
+        mask = np.zeros((200, 300), dtype=np.uint8)
+        mask[50:150, 70:230] = 255
+        # OpenCV 5 returns HoughLinesP as (N, 4); OpenCV 4 wrapped them as
+        # (N, 1, 4).  Four parallel ~2.86° lines must still be read correctly.
+        hough_lines.return_value = np.array(
+            [
+                [0, 0, 200, 10],
+                [0, 10, 200, 20],
+                [0, 20, 200, 30],
+                [0, 30, 200, 40],
+            ],
+            dtype=np.int32,
+        )
+
+        angle, support = _rotation_angle(image, mask)
+
+        self.assertAlmostEqual(angle, 2.86, places=2)
+        self.assertGreaterEqual(support, 0.55)
 
     def test_near_border_rotation_is_skipped_instead_of_clipped(self):
         source = np.full((180, 260, 3), 90, dtype=np.uint8)

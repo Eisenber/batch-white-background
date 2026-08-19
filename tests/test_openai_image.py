@@ -18,6 +18,7 @@ from rembg.openai_image import (
     OpenAISubmissionUncertainError,
     choose_output_size,
     _map_sdk_error,
+    _resolve_image_config,
 )
 from rembg.product_batch import process_product_batch
 from rembg.product_image import BatchOptions, process_generated_product_image
@@ -70,6 +71,52 @@ class OpenAIImageTests(unittest.TestCase):
     def test_missing_key_fails_before_gateway_creation(self):
         with self.assertRaisesRegex(OpenAIConfigurationError, "OPENAI_API_KEY"):
             OpenAIImageSession(environ={})
+
+    def test_gateway_forwards_base_url_and_model_to_client(self):
+        captured = {}
+        client = FakeClient()
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        gateway = OpenAIImageGateway(
+            "secret-for-test",
+            base_url="https://qlyyds-resource.tech",
+            model="gpt-image-2",
+            client_factory=factory,
+        )
+        gateway.edit(
+            image_bytes=b"source image",
+            filename="source.png",
+            content_type="image/png",
+            prompt=OPENAI_IMAGE_PROMPT,
+            size="1536x1024",
+        )
+
+        self.assertEqual(captured["api_key"], "secret-for-test")
+        self.assertEqual(captured["base_url"], "https://qlyyds-resource.tech")
+        self.assertEqual(client.images.calls[0]["model"], "gpt-image-2")
+
+    def test_resolve_config_prefers_image_vars(self):
+        api_key, base_url, model = _resolve_image_config(
+            {
+                "IMG_API_KEY": "relay-key",
+                "IMG_BASE_URL": "https://qlyyds-resource.tech",
+                "IMG_MODEL": "gpt-image-2",
+            }
+        )
+        self.assertEqual(api_key, "relay-key")
+        self.assertEqual(base_url, "https://qlyyds-resource.tech")
+        self.assertEqual(model, "gpt-image-2")
+
+    def test_resolve_config_falls_back_to_legacy_key_and_defaults(self):
+        api_key, base_url, model = _resolve_image_config(
+            {"OPENAI_API_KEY": "legacy-key"}
+        )
+        self.assertEqual(api_key, "legacy-key")
+        self.assertIsNone(base_url)
+        self.assertEqual(model, OPENAI_IMAGE_MODEL)
 
     def test_gateway_disables_sdk_retries_and_uses_image_edit(self):
         captured = {}

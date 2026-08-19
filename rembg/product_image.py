@@ -364,7 +364,8 @@ def _rotation_angle(
         return 0.0, 0.0
 
     candidates: list[tuple[float, float]] = []
-    for x1, y1, x2, y2 in lines[:, 0]:
+    # OpenCV 5 returns lines as (N, 4); OpenCV 4 wrapped them as (N, 1, 4).
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
         dx, dy = float(x2 - x1), float(y2 - y1)
         length = float(np.hypot(dx, dy))
         angle = float(np.degrees(np.arctan2(dy, dx)))

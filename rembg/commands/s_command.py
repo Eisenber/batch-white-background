@@ -2,6 +2,13 @@ import ipaddress
 import json
 import socket
 import webbrowser
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 from typing import List, Optional, Tuple, Union, cast
 from urllib.parse import urljoin, urlparse
 

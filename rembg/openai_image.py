@@ -183,6 +183,8 @@ class OpenAIImageGateway:
         self,
         api_key: str,
         *,
+        base_url: str | None = None,
+        model: str = OPENAI_IMAGE_MODEL,
         client_factory: Callable[..., Any] | None = None,
         timeout_seconds: float = 180.0,
     ):
@@ -194,11 +196,15 @@ class OpenAIImageGateway:
                     "缺少 OpenAI Python 依赖，请先安装 requirements-openai.txt"
                 ) from exc
             client_factory = OpenAI
-        self._client = client_factory(
-            api_key=api_key,
-            max_retries=0,
-            timeout=timeout_seconds,
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "max_retries": 0,
+            "timeout": timeout_seconds,
+        }
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self._client = client_factory(**client_kwargs)
+        self._model = model
 
     def edit(
         self,
@@ -211,7 +217,7 @@ class OpenAIImageGateway:
     ) -> bytes:
         try:
             response = self._client.images.edit(
-                model=OPENAI_IMAGE_MODEL,
+                model=self._model,
                 image=(filename, image_bytes, content_type),
                 prompt=prompt,
                 size=size,
@@ -240,6 +246,20 @@ class OpenAIImageGateway:
         return raw
 
 
+def _resolve_image_config(
+    environment: Mapping[str, str],
+) -> tuple[str, str | None, str]:
+    """Resolve image-generation credentials, endpoint, and model from env."""
+
+    api_key = (
+        environment.get("IMG_API_KEY")
+        or environment.get("OPENAI_API_KEY", "")
+    ).strip()
+    base_url = environment.get("IMG_BASE_URL", "").strip() or None
+    model = environment.get("IMG_MODEL", "").strip() or OPENAI_IMAGE_MODEL
+    return api_key, base_url, model
+
+
 class OpenAIImageSession:
     """Prepare and generate one complete GPT Image 2 product photograph."""
 
@@ -251,12 +271,15 @@ class OpenAIImageSession:
         stage_callback: Callable[[str], None] | None = None,
     ):
         environment = os.environ if environ is None else environ
-        api_key = environment.get("OPENAI_API_KEY", "").strip()
+        api_key, base_url, model = _resolve_image_config(environment)
         if not api_key:
             raise OpenAIConfigurationError(
-                "未配置 OPENAI_API_KEY；请在启动工作台的终端设置后重新运行"
+                "未配置 IMG_API_KEY（或 OPENAI_API_KEY）；请在启动工作台的终端设置后重新运行"
             )
-        self._gateway = gateway or OpenAIImageGateway(api_key)
+        self._model = model
+        self._gateway = gateway or OpenAIImageGateway(
+            api_key, base_url=base_url, model=model
+        )
         self._stage_callback = stage_callback
         self._fatal_error: OpenAIImageError | None = None
 
@@ -292,7 +315,7 @@ class OpenAIImageSession:
         self._stage("正在恢复原图尺寸")
         return GeneratedProductImage(
             image=output,
-            model=OPENAI_IMAGE_MODEL,
+            model=self._model,
             requested_width=width,
             requested_height=height,
             returned_width=output.width,

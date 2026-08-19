@@ -1,2 +1,4 @@
 # OpenAI GPT Image 2 high-quality generation mode.
 openai>=3.2,<4
+# Load IMG_* credentials and relay endpoint from a local .env file.
+python-dotenv>=1.0,<2
